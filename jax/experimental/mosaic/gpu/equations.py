@@ -20,7 +20,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import math
-from typing import Any, Callable, assert_never, final
+from typing import Any, Callable, assert_never, final, override
 
 from . import fragmented_array as fa
 from . import layouts as layouts_lib
@@ -349,6 +349,45 @@ class Relayout:
 
 
 @dataclasses.dataclass(frozen=True)
+class TMEMRelayout(Relayout):
+  """Same as Relayout, but the source or destination must be a TMEM layout."""
+
+  packing: int
+  columns: int
+
+  def _is_valid_tmem_relayout(
+      self, source: tcgen05.TMEMLayout, target: fa.FragmentedLayout
+  ) -> bool:
+    if target == fa.TCGEN05_LAYOUT or target == fa.TMEM_NATIVE_LAYOUT:
+      return source == tcgen05.tmem_default_layout(self.packing)
+    if target == fa.WGMMA_LAYOUT:
+      return source == tcgen05.tmem_half_lane_layout(self.columns, self.packing)
+    if target == tcgen05.fa_m64_collective_layout(self.columns):
+      return source == tcgen05.tmem_m64_collective_layout(
+          self.columns, self.packing
+      )
+    return False
+
+  @override
+  def holds(self) -> bool | None:
+    source = self.source
+    target = self.target
+
+    if isinstance(source, TMEMLayout) and isinstance(target, RegisterLayout):
+      return self._is_valid_tmem_relayout(source.value, target.value)
+    if isinstance(target, TMEMLayout) and isinstance(source, RegisterLayout):
+      return self._is_valid_tmem_relayout(target.value, source.value)
+    if isinstance(source, TMEMLayout) and isinstance(target, TMEMLayout):
+      return source == target
+
+    return None
+
+  @override
+  def __str__(self):
+    return f"TMEMRelayout({self.source}  ⟶ {self.target})"
+
+
+@dataclasses.dataclass(frozen=True)
 class Distinct:
   """States that `lhs != rhs`."""
   lhs: Expression
@@ -390,7 +429,12 @@ def reduce_constraint(
   if isinstance(lhs_red, Unsatisfiable) or isinstance(rhs_red, Unsatisfiable):
     return Unsatisfiable()
 
-  new_constraint = type(constraint)(lhs_red, rhs_red)
+  if isinstance(constraint, Distinct):
+    new_constraint = Distinct(lhs_red, rhs_red)
+  else:
+    new_constraint = dataclasses.replace(
+        constraint, source=lhs_red, target=rhs_red
+    )
   constraint_holds = new_constraint.holds()
   if constraint_holds is None:
     return new_constraint

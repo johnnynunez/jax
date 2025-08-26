@@ -826,10 +826,9 @@ if jaxlib.version >= (0, 7, 2):
       ctx: DerivationContext,
       op: mgpu.TmemLayoutCastOp,
   ) -> tuple[eqns.EquationSystem, OperandOrResultsForVariable, list[Hint]]:
-    del ctx
     operand = OperandOrResult(op, VariableType.OPERAND, 0)
+    variable = ctx.producer_ref(operand)
     result = OperandOrResult(op, VariableType.RESULT, 0)
-    variable = eqns.Variable(operand)
     out_layout = eqns.TMEMLayout(_tmem_layout_from_layout_attr(op.new_layout))
     return (
         eqns.EquationSystem(assignments={variable: out_layout}),
@@ -886,6 +885,54 @@ def _tcgen05_mma_equation_system(
     operands_for_variable[a_variable] = [a]
 
   return eqns.EquationSystem(assignments), operands_for_variable, []
+
+
+@_add_equation_system_derivation_rule(mgpu.AsyncLoadTmemOp)
+def _async_load_tmem_equation_system(
+    ctx: DerivationContext,
+    op: mgpu.AsyncLoadTmemOp,
+) -> tuple[eqns.EquationSystem, OperandOrResultsForVariable, list[Hint]]:
+  source = OperandOrResult(op, VariableType.OPERAND, 0)
+  source_variable = ctx.producer_ref(source)
+  source_alloc = source_variable.key.operation
+  assert isinstance(source_alloc, mgpu.TmemAllocOp)
+  destination = OperandOrResult(op, VariableType.RESULT, 0)
+  destination_variable = eqns.Variable(destination)
+  constraint = eqns.TMEMRelayout(
+      source_variable,
+      destination_variable,
+      source_alloc.packing.value,
+      source_alloc.result.type.shape[1],
+  )
+  return (
+      eqns.EquationSystem(constraints=[constraint]),
+      {source_variable: [source], destination_variable: [destination]},
+      [],
+  )
+
+
+@_add_equation_system_derivation_rule(mgpu.AsyncStoreTmemOp)
+def _async_store_tmem_equation_system(
+    ctx: DerivationContext,
+    op: mgpu.AsyncStoreTmemOp,
+) -> tuple[eqns.EquationSystem, OperandOrResultsForVariable, list[Hint]]:
+  source = OperandOrResult(op, VariableType.OPERAND, 0)
+  source_variable = eqns.Variable(source)
+  destination = OperandOrResult(op, VariableType.OPERAND, 1)
+  destination_variable = ctx.producer_ref(destination)
+  destination_alloc = destination_variable.key.operation
+  assert isinstance(destination_alloc, mgpu.TmemAllocOp)
+  constraint = eqns.TMEMRelayout(
+      source_variable,
+      destination_variable,
+      destination_alloc.packing.value,
+      destination_alloc.result.type.shape[1],
+  )
+  return (
+      eqns.EquationSystem(constraints=[constraint]),
+      {source_variable: [source], destination_variable: [destination]},
+      [],
+  )
 
 
 def _ensure_all_layouts_are_set(op: ir.OpView) -> None:
@@ -1172,7 +1219,12 @@ def infer_layout(module: ir.Module):
   for op in module.body:
     inference_utils.traverse_op(op, gather_equations)
 
-  assert not isinstance(global_equation_system, eqns.Unsatisfiable)
+  if isinstance(global_equation_system, eqns.Unsatisfiable):
+    raise ValueError(
+        "Failed to infer a possible set of layouts. This should only happen if "
+        "user-provided layout casts are unsatisfiable."
+    )
+
   propagation_hints, constraints = derive_hints_and_constraints(ctx.operand_and_results_for_variable)
   hints = reduce_hints(hints + propagation_hints, global_equation_system.assignments)  # pytype: disable=attribute-error
   global_equation_system &= eqns.EquationSystem(constraints=constraints)
