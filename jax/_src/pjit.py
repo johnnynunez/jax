@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Sequence, Iterable
-import contextlib
 import dataclasses
 from functools import partial
 import inspect
@@ -2947,91 +2946,6 @@ def _sharding_constraint_batcher(
 batching.fancy_primitive_batchers[sharding_constraint_p] = _sharding_constraint_batcher
 batching.skippable_batchers[sharding_constraint_p] = lambda _: ()
 
-# -------------------- mesh_cast ---------------------------
-
-# TODO(yashkatariya): Make shardings optional.
-def mesh_cast(xs, out_shardings):
-  x_flat, treedef = tree_flatten(xs)
-  shardings_flat = flatten_axis_resources(
-      "mesh_cast out_shardings", treedef, out_shardings, tupled_args=True)
-  out_flat = [
-      mesh_cast_p.bind(
-          x, dst_sharding=canonicalize_sharding(
-              s, 'mesh_cast', check_mesh_consistency=False))
-      for x, s in safe_zip(x_flat, shardings_flat)
-  ]
-  return tree_unflatten(treedef, out_flat)
-
-mesh_cast_p = core.Primitive('mesh_cast')
-mesh_cast_p.skip_canonicalization = True
-def _mesh_cast_abstract_eval(aval, dst_sharding):
-  src_sharding = aval.sharding
-  if src_sharding == dst_sharding:
-    return aval
-  if src_sharding.mesh.empty or dst_sharding.mesh.empty:
-    return aval.update(sharding=dst_sharding)
-  if src_sharding.mesh.shape_tuple != dst_sharding.mesh.shape_tuple:
-    raise ValueError(
-        f'Mesh shape of the input {src_sharding.mesh.shape_tuple} does not'
-        ' match the mesh shape of the target sharding'
-        f' {dst_sharding.mesh.shape_tuple} for shape {aval.str_short()}')
-  if (src_sharding.mesh.axis_types == dst_sharding.mesh.axis_types
-      and src_sharding.spec != dst_sharding.spec):
-    raise ValueError(
-        'mesh_cast should only be used when AxisType changes between the'
-        ' input mesh and the target mesh. Got src'
-        f' axis_types={src_sharding.mesh.axis_types} and dst'
-        f' axis_types={dst_sharding.mesh.axis_types}. To reshard between'
-        ' the same mesh, use `jax.sharding.reshard` instead?')
-  if src_sharding.mesh._any_axis_explicit and dst_sharding.mesh._any_axis_explicit:
-    for s, d in safe_zip(flatten_spec(src_sharding.spec),
-                         flatten_spec(dst_sharding.spec)):
-      if s is None and d is None:
-        continue
-      if s is None and d is not None:
-        assert (src_sharding.mesh._name_to_type[d] == mesh_lib.AxisType.Auto
-                and dst_sharding.mesh._name_to_type[d] == mesh_lib.AxisType.Explicit)
-        continue
-      if s is not None and d is None:
-        assert (src_sharding.mesh._name_to_type[s] == mesh_lib.AxisType.Explicit
-                and dst_sharding.mesh._name_to_type[s] == mesh_lib.AxisType.Auto)
-        continue
-      if d != s:
-        raise ValueError(
-            'Explicit data movement in mesh_cast is not allowed. Got src spec:'
-            f' {s} and dst spec: {d}')
-  return aval.update(sharding=dst_sharding)
-mesh_cast_p.def_abstract_eval(_mesh_cast_abstract_eval)
-
-def _mesh_cast_impl(x, dst_sharding):
-  return dispatch.apply_primitive(mesh_cast_p, x, dst_sharding=dst_sharding)
-mesh_cast_p.def_impl(_mesh_cast_impl)
-
-def _mesh_cast_transpose_rule(ct, x, dst_sharding):
-  return [mesh_cast_p.bind(ct, dst_sharding=x.aval.sharding)]
-ad.deflinear2(mesh_cast_p, _mesh_cast_transpose_rule)
-
-def _mesh_cast_hlo_lowering(ctx, x_node, *, dst_sharding):
-  aval_in, = ctx.avals_in
-  aval_out, = ctx.avals_out
-  if dtypes.issubdtype(aval_in.dtype, dtypes.extended):
-    aval_in = core.physical_aval(aval_in)
-  proto = (dst_sharding._to_sdy_sharding(aval_in.ndim)
-           if config.use_shardy_partitioner.value else
-           dst_sharding._to_xla_hlo_sharding(aval_in.ndim).to_proto())
-  return [mlir.lower_with_sharding_in_types(ctx, x_node, aval_out, proto)]
-mlir.register_lowering(mesh_cast_p, _mesh_cast_hlo_lowering)
-
-def _mesh_cast_batcher(axis_data, vals_in, dims_in, dst_sharding):
-  x, = vals_in
-  d, = dims_in
-  vmapped_dst_sharding = batching.get_sharding_for_vmap(
-      axis_data, dst_sharding, d)
-  y = mesh_cast_p.bind(x, dst_sharding=vmapped_dst_sharding)
-  return y, d
-batching.fancy_primitive_batchers[mesh_cast_p] = _mesh_cast_batcher
-batching.skippable_batchers[mesh_cast_p] = lambda _: ()
-
 # -------------------- reshard ------------------------------------
 
 def reshard(xs, out_shardings):
@@ -3041,7 +2955,7 @@ def reshard(xs, out_shardings):
   x_avals_flat = [core.shaped_abstractify(x) for x in x_flat]
   out_flat = []
   for x, x_aval, s in safe_zip(x_flat, x_avals_flat, shardings_flat):
-    ds = canonicalize_sharding(s, 'reshard')
+    ds = canonicalize_sharding(s, 'reshard', check_mesh_consistency=False)
     if ds is None:
       raise ValueError(
           'Reshard should only be used with out_shardings which are non-None '
@@ -3052,22 +2966,15 @@ def reshard(xs, out_shardings):
   return tree_unflatten(treedef, out_flat)
 
 reshard_p = core.Primitive('reshard')
+reshard_p.skip_canonicalization = True
 
 def _reshard_abstract_eval(aval, dst_sharding):
-  src_sharding = aval.sharding
-  if (not src_sharding.mesh.empty and
-      src_sharding.mesh.abstract_mesh != dst_sharding.mesh.abstract_mesh):
-    raise ValueError(
-        f'Mesh of the input {src_sharding.mesh.abstract_mesh} does not'
-        ' equal the mesh of the target sharding'
-        f' {dst_sharding.mesh.abstract_mesh} for shape {aval.str_short()}')
+  if aval.sharding == dst_sharding:
+    return aval
   return aval.update(sharding=dst_sharding)
 reshard_p.def_abstract_eval(_reshard_abstract_eval)
 
 def _reshard_impl(x, dst_sharding):
-  cur_concrete_mesh = mesh_lib.get_concrete_mesh()
-  if not cur_concrete_mesh.empty and not cur_concrete_mesh.is_multi_process:
-    return api.device_put(x, dst_sharding.spec)
   return dispatch.apply_primitive(reshard_p, x, dst_sharding=dst_sharding)
 reshard_p.def_impl(_reshard_impl)
 
@@ -3099,8 +3006,7 @@ batching.skippable_batchers[reshard_p] = lambda _: ()
 # -------------------- auto and user mode -------------------------
 
 def _get_new_mesh(axes: str | tuple[str, ...] | None,
-                  axis_type: mesh_lib.AxisType, name: str, shardings=None,
-                  error_on_manual_to_auto_explicit=False):
+                  axis_type: mesh_lib.AxisType, name: str, shardings=None):
   cur_mesh = mesh_lib.get_abstract_mesh()
   flat_shardings, _ = tree_flatten(shardings)
   sharding_mesh = mesh_lib.empty_abstract_mesh
@@ -3135,8 +3041,7 @@ def _get_new_mesh(axes: str | tuple[str, ...] | None,
   if not isinstance(axes, tuple):
     axes = (axes,)
   for a in axes:
-    if (error_on_manual_to_auto_explicit and
-        mesh_to_use._name_to_type[a] == mesh_lib.AxisType.Manual and
+    if (mesh_to_use._name_to_type[a] == mesh_lib.AxisType.Manual and
         axis_type in {mesh_lib.AxisType.Auto, mesh_lib.AxisType.Explicit}):
       raise NotImplementedError(
           'Going from `Manual` AxisType to `Auto` or `Explicit` AxisType is not'
@@ -3162,24 +3067,16 @@ def _auto_axes(fun, *, axes_, out_sharding):
     else:
       _out_sharding = out_sharding
     new_mesh, prev_mesh, axes = _get_new_mesh(
-        axes_, mesh_lib.AxisType.Auto, 'auto_axes', shardings=_out_sharding,
-        error_on_manual_to_auto_explicit=True)
+        axes_, mesh_lib.AxisType.Auto, 'auto_axes', shardings=_out_sharding)
     if set(prev_mesh.auto_axes) == set(axes):
       return fun(*args, **kwargs)
     with mesh_lib.use_abstract_mesh(new_mesh):
       in_specs = tree_map(lambda a: core.modify_spec_for_auto_manual(
           core.get_aval(a).sharding.spec, new_mesh), args)
-      args = mesh_cast(args, in_specs)
+      args = reshard(args, in_specs)
       out = fun(*args, **kwargs)
-    return mesh_cast(out, _out_sharding)
+    return reshard(out, _out_sharding)
   return decorator
-
-
-@contextlib.contextmanager
-def use_auto_axes(*axes):
-  new_mesh, _, _ = _get_new_mesh(axes, mesh_lib.AxisType.Auto, 'use_auto_axes')
-  with mesh_lib.use_abstract_mesh(new_mesh):
-    yield
 
 
 def explicit_axes(f=None, /, *, axes: str | tuple[str, ...] | None = None,
@@ -3198,24 +3095,15 @@ def _explicit_axes(fun, *, axes, in_sharding):
         raise TypeError("Missing required keyword argument: 'in_sharding'")
     else:
       _in_sharding = in_sharding
-    new_mesh, _, _ = _get_new_mesh(
-        axes, mesh_lib.AxisType.Explicit, 'explicit_axes',
-        error_on_manual_to_auto_explicit=True)
+    new_mesh, _, _ = _get_new_mesh(axes, mesh_lib.AxisType.Explicit,
+                                   'explicit_axes')
     with mesh_lib.use_abstract_mesh(new_mesh):
-      args = mesh_cast(args, _in_sharding)
+      args = reshard(args, _in_sharding)
       out = fun(*args, **kwargs)
     out_specs = tree_map(lambda o: core.modify_spec_for_auto_manual(
         core.get_aval(o).sharding.spec, mesh_lib.get_abstract_mesh()), out)
-    return mesh_cast(out, out_specs)
+    return reshard(out, out_specs)
   return decorator
-
-
-@contextlib.contextmanager
-def use_explicit_axes(*axes):
-  new_mesh, _, _ = _get_new_mesh(
-      axes, mesh_lib.AxisType.Explicit, 'use_explicit_axes')
-  with mesh_lib.use_abstract_mesh(new_mesh):
-    yield
 
 # -------------------- with_layout_constraint --------------------
 
